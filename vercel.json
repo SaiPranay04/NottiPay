@@ -1,0 +1,7 @@
+{
+  "crons": [
+    { "path": "/api/cron/fx", "schedule": "45 6 * * *" },
+    { "path": "/api/cron/fx", "schedule": "45 16 * * *" },
+    { "path": "/api/cron/digest", "schedule": "0 18 * * 0" }
+  ]
+}
