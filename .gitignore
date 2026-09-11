@@ -1,8 +1,24 @@
+# dependencies and build
 node_modules
 .next
 out
+
+# secrets
 .env
 .env.local
+
+# os / logs
 .DS_Store
 *.log
 data/.local-db.json
+
+# design leftovers — not needed to run or deploy
+Claude_UI_Mega_Prompt.md
+Vezora_Finance_*.md
+files/
+files.zip
+*.zip
+/ChatGPT Image*.png
+
+# one-off local scripts
+scripts/

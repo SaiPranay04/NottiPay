@@ -1,6 +1,7 @@
 'use client';
 
 import React, { useState, useEffect, useMemo, useRef, useCallback, createContext, useContext } from 'react';
+import { matchAccount } from '@/lib/account-alias';
 
 
 /* ======== format.js ======== */
@@ -645,10 +646,18 @@ let seq = 100;
 const nextId = (p) => `${p}${++seq}`;
 
 function StoreProvider({ children }) {
+  const [ready, setReady] = useState(false);
+  const [live, setLive] = useState(false);
+  const [authEmail, setAuthEmail] = useState(null);
   const [accounts, setAccounts] = useState(mock.accounts);
   const [transactions, setTransactions] = useState(mock.transactions);
   const [commitments, setCommitments] = useState(mock.commitments);
   const [loan, setLoan] = useState(mock.loan);
+  const [categories, setCategories] = useState(mock.categories);
+  const [budgets, setBudgets] = useState(mock.budgets);
+  const [profile, setProfile] = useState(mock.profile);
+  const [today, setToday] = useState(mock.TODAY);
+  const [now, setNow] = useState(mock.NOW);
   const [settings, setSettings] = useState({
     ...mock.settings,
     theme: store.get('vf.theme', mock.settings.theme),
@@ -657,8 +666,71 @@ function StoreProvider({ children }) {
   const [shifts, setShifts] = useState([]);
   const [toast, setToast] = useState(null);
   const [snapshot, setSnapshot] = useState(null);
+  const [undoLiveId, setUndoLiveId] = useState(null);
+  const [fx, setFx] = useState(mock.fx);
 
-  const rate = mock.fx.rate;
+  const rate = fx.rate;
+  const monthKey = today.slice(0, 7);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const fxRes = await fetch('/api/fx/latest');
+        const liveFx = await fxRes.json();
+        if (!cancelled && liveFx?.gbp_in_inr) {
+          setFx({
+            pair: 'GBP/INR',
+            rate: liveFx.gbp_in_inr,
+            asOf: liveFx.as_of,
+            source: liveFx.source,
+            nextCheck: liveFx.next_check || mock.fx.nextCheck,
+          });
+        }
+      } catch {
+        /* keep the last known rate */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch('/api/me');
+        const data = await res.json();
+        if (cancelled || !data || data.mode !== 'live') return;
+        setLive(true);
+        setAuthEmail(data.email || null);
+        setAccounts(data.accounts);
+        setTransactions(data.transactions);
+        setCommitments(data.commitments);
+        if (data.loan) setLoan(data.loan);
+        if (data.categories?.length) setCategories(data.categories);
+        if (data.budgets?.length) setBudgets(data.budgets);
+        if (data.profile) setProfile({ ...mock.profile, ...data.profile });
+        setToday(data.today);
+        setNow(new Date().toISOString());
+        setSettings((s) => ({
+          ...s,
+          ...data.settings,
+          theme: s.theme,
+          offline: false,
+          demoJob: false,
+        }));
+      } catch {
+        /* stay on the in-browser demo */
+      } finally {
+        if (!cancelled) setReady(true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // ---- derived ----------------------------------------------------
 
@@ -677,16 +749,19 @@ function StoreProvider({ children }) {
           c.reserved &&
           c.status === 'unpaid' &&
           c.currency === 'GBP' &&
-          daysBetween(mock.TODAY, c.dueDate) <= daysBetween(mock.TODAY, settings.nextPayday)
+          daysBetween(today, c.dueDate) <= daysBetween(today, settings.nextPayday || today)
       ),
-    [commitments, settings.nextPayday]
+    [commitments, settings.nextPayday, today]
   );
 
   const reserved = useMemo(() => reservedList.reduce((n, c) => n + c.amount, 0), [reservedList]);
 
-  const safe = spendable - reserved - settings.pacedEssentials - settings.emergencyFloor;
+  const safe = Math.max(
+    0,
+    spendable - reserved - settings.pacedEssentials - settings.emergencyFloor,
+  );
 
-  const daysLeftInWeek = Math.max(1, daysBetween(mock.TODAY, settings.weekEndsOn) + 1);
+  const daysLeftInWeek = Math.max(1, daysBetween(today, settings.weekEndsOn) + 1);
   const dailySafe = Math.round(safe / daysLeftInWeek);
 
   const band = dailySafe >= 2500 ? 'ok' : dailySafe >= 1200 ? 'tight' : 'stop';
@@ -694,46 +769,46 @@ function StoreProvider({ children }) {
   const expenses = useMemo(() => transactions.filter((t) => t.type === 'expense'), [transactions]);
 
   const spentToday = useMemo(
-    () => expenses.filter((t) => t.date === mock.TODAY).reduce((n, t) => n + t.amount, 0),
-    [expenses]
+    () => expenses.filter((t) => t.date === today).reduce((n, t) => n + t.amount, 0),
+    [expenses, today]
   );
   const spentWeek = useMemo(
     () =>
       expenses
-        .filter((t) => daysBetween(t.date, mock.TODAY) <= 6 && daysBetween(t.date, mock.TODAY) >= 0)
+        .filter((t) => daysBetween(t.date, today) <= 6 && daysBetween(t.date, today) >= 0)
         .reduce((n, t) => n + t.amount, 0),
-    [expenses]
+    [expenses, today]
   );
   const spentMonth = useMemo(
-    () => expenses.filter((t) => t.date.startsWith('2026-08')).reduce((n, t) => n + t.amount, 0),
-    [expenses]
+    () => expenses.filter((t) => t.date.startsWith(monthKey)).reduce((n, t) => n + t.amount, 0),
+    [expenses, monthKey]
   );
 
   const byCategory = useMemo(() => {
     const map = {};
     expenses
-      .filter((t) => t.date.startsWith('2026-08'))
+      .filter((t) => t.date.startsWith(monthKey))
       .forEach((t) => {
         map[t.category] = (map[t.category] || 0) + t.amount;
       });
-    return mock.categories
+    return categories
       .map((c) => ({ ...c, spent: map[c.id] || 0 }))
       .filter((c) => c.spent > 0)
       .sort((a, b) => b.spent - a.spent);
-  }, [expenses]);
+  }, [expenses, categories, monthKey]);
 
   const cashVsCard = useMemo(() => {
     let cash = 0;
     let card = 0;
     expenses
-      .filter((t) => t.date.startsWith('2026-08'))
+      .filter((t) => t.date.startsWith(monthKey))
       .forEach((t) => {
         const acc = accounts.find((a) => a.id === t.accountId);
         if (acc && acc.kind === 'cash') cash += t.amount;
         else card += t.amount;
       });
     return { cash, card };
-  }, [expenses, accounts]);
+  }, [expenses, accounts, monthKey]);
 
   const groceriesMonth = byCategory.find((c) => c.id === 'groceries')?.spent || 0;
 
@@ -747,9 +822,9 @@ function StoreProvider({ children }) {
   );
 
   const loanFigures = useMemo(() => {
-    const taken = loan.disbursements.reduce((n, x) => n + x.amount, 0);
+    const taken = (loan.disbursements || []).reduce((n, x) => n + x.amount, 0);
     // Simple interest accrued during the moratorium, to the calc date.
-    const interest = loan.disbursements.reduce((n, x) => {
+    const interest = (loan.disbursements || []).reduce((n, x) => {
       const days = daysBetween(x.date, loan.calcDate);
       return n + Math.round((x.amount * (loan.ratePct / 100) * days) / 365);
     }, 0);
@@ -764,7 +839,7 @@ function StoreProvider({ children }) {
   const shiftFigures = useMemo(() => {
     const paidMin = (s) => s.minutes - s.breakMinutes;
     const pay = (s) => Math.round((paidMin(s) * s.rate) / 60);
-    const week = shifts.filter((s) => daysBetween(s.date, mock.TODAY) <= 6);
+    const week = shifts.filter((s) => daysBetween(s.date, today) <= 6);
     return {
       pay,
       paidMin,
@@ -773,7 +848,7 @@ function StoreProvider({ children }) {
       expected: shifts.reduce((n, s) => n + pay(s), 0),
       received: shifts.filter((s) => s.paid).reduce((n, s) => n + pay(s), 0),
     };
-  }, [shifts]);
+  }, [shifts, today]);
 
   // ---- mutations ---------------------------------------------------
 
@@ -782,7 +857,21 @@ function StoreProvider({ children }) {
     [accounts, transactions, commitments, loan, shifts, employer]
   );
 
-  const restore = useCallback(() => {
+  const restore = useCallback(async () => {
+    if (live && undoLiveId) {
+      const id = undoLiveId;
+      setUndoLiveId(null);
+      const res = await fetch(`/api/transactions?id=${encodeURIComponent(id)}`, { method: 'DELETE' });
+      const data = await res.json().catch(() => null);
+      if (!res.ok) {
+        setToast({ id: nextId('k'), text: 'Could not undo', undo: false });
+        return;
+      }
+      setTransactions((xs) => xs.filter((t) => t.id !== id));
+      if (data?.accounts) setAccounts(data.accounts);
+      setToast({ id: nextId('k'), text: 'Reverted', undo: false });
+      return;
+    }
     if (!snapshot) return;
     setAccounts(snapshot.accounts);
     setTransactions(snapshot.transactions);
@@ -792,11 +881,35 @@ function StoreProvider({ children }) {
     setEmployer(snapshot.employer);
     setSnapshot(null);
     setToast({ id: nextId('k'), text: 'Reverted', undo: false });
-  }, [snapshot]);
+  }, [snapshot, live, undoLiveId]);
 
   const say = (text, undo = true) => setToast({ id: nextId('k'), text, undo });
 
-  const addTransaction = (t) => {
+  const addTransaction = async (t) => {
+    if (live) {
+      const res = await fetch('/api/transactions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          amount_minor: t.amount,
+          account_id: t.accountId,
+          category: t.category,
+          merchant: t.merchant,
+          note: t.note || '',
+          occurred_at: t.date || today,
+        }),
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data?.transaction) {
+        say('Could not save — try again', false);
+        return null;
+      }
+      setTransactions((xs) => [data.transaction, ...xs]);
+      if (data.accounts) setAccounts(data.accounts);
+      setUndoLiveId(data.transaction.id);
+      say(`Saved — ${data.transaction.merchant}`);
+      return data.transaction;
+    }
     capture();
     const tx = { id: nextId('t'), type: 'expense', note: '', ...t };
     setTransactions((xs) => [tx, ...xs]);
@@ -807,7 +920,20 @@ function StoreProvider({ children }) {
     return tx;
   };
 
-  const reverseTransaction = (id) => {
+  const reverseTransaction = async (id) => {
+    if (live) {
+      const res = await fetch(`/api/transactions?id=${encodeURIComponent(id)}`, { method: 'DELETE' });
+      const data = await res.json().catch(() => null);
+      if (!res.ok) {
+        say('Could not reverse', false);
+        return;
+      }
+      const tx = transactions.find((t) => t.id === id);
+      setTransactions((xs) => xs.filter((t) => t.id !== id));
+      if (data?.accounts) setAccounts(data.accounts);
+      say(`Reversed — ${tx?.merchant || 'entry'}`);
+      return;
+    }
     capture();
     const tx = transactions.find((t) => t.id === id);
     if (!tx) return;
@@ -818,7 +944,30 @@ function StoreProvider({ children }) {
     say(`Reversed — ${tx.merchant}`);
   };
 
-  const updateTransaction = (id, patch) => {
+  const updateTransaction = async (id, patch) => {
+    if (live) {
+      const res = await fetch('/api/transactions', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          id,
+          amount_minor: patch.amount,
+          merchant: patch.merchant,
+          category: patch.category,
+          note: patch.note,
+          account_id: patch.accountId,
+        }),
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data?.transaction) {
+        say('Could not update', false);
+        return;
+      }
+      setTransactions((xs) => xs.map((t) => (t.id === id ? data.transaction : t)));
+      if (data.accounts) setAccounts(data.accounts);
+      say('Updated');
+      return;
+    }
     capture();
     const before = transactions.find((t) => t.id === id);
     setTransactions((xs) => xs.map((t) => (t.id === id ? { ...t, ...patch } : t)));
@@ -857,9 +1006,10 @@ function StoreProvider({ children }) {
     const s = shifts.find((x) => x.id === id);
     if (s) {
       const amount = Math.round(((s.minutes - s.breakMinutes) * s.rate) / 60);
+      const bank = matchAccount(accounts, 'acc_uk_bank');
       setAccounts((xs) =>
         xs.map((a) =>
-          a.id === 'acc_uk_bank'
+          a.id === (bank?.id || 'acc_uk_bank')
             ? { ...a, balance: a.balance + (becamePaid ? amount : -amount) }
             : a
         )
@@ -882,30 +1032,71 @@ function StoreProvider({ children }) {
     const c = commitments.find((x) => x.id === id);
     setCommitments((xs) => xs.map((x) => (x.id === id ? { ...x, status: 'paid' } : x)));
     if (c && c.currency === 'GBP') {
-      setAccounts((xs) =>
-        xs.map((a) => (a.id === 'acc_forex' ? { ...a, balance: a.balance - c.amount } : a))
-      );
-      setTransactions((xs) => [
-        {
-          id: nextId('t'),
-          date: mock.TODAY,
-          merchant: c.name,
-          category: c.kind === 'fees' ? 'university' : c.kind,
-          accountId: 'acc_forex',
-          amount: c.amount,
-          type: 'expense',
-          note: 'Commitment',
-        },
-        ...xs,
-      ]);
+      const forex = matchAccount(accounts, 'acc_forex');
+      const accountId = forex?.id || 'acc_forex';
+      const draft = {
+        amount: c.amount,
+        merchant: c.name,
+        category: c.kind === 'fees' ? 'university' : c.kind,
+        accountId,
+        date: today,
+        note: 'Commitment',
+      };
+      if (live) {
+        addTransaction(draft);
+      } else {
+        setAccounts((xs) =>
+          xs.map((a) => (a.id === accountId ? { ...a, balance: a.balance - c.amount } : a))
+        );
+        setTransactions((xs) => [
+          {
+            id: nextId('t'),
+            type: 'expense',
+            ...draft,
+          },
+          ...xs,
+        ]);
+      }
     }
     say('Marked paid');
   };
 
-  const toggleInclude = (id) => {
+  const toggleInclude = async (id) => {
+    const current = accounts.find((a) => a.id === id);
+    const next = current ? !current.includeInSafeSpend : false;
     setAccounts((xs) =>
       xs.map((a) => (a.id === id ? { ...a, includeInSafeSpend: !a.includeInSafeSpend } : a))
     );
+    if (live) {
+      const res = await fetch('/api/accounts', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id, include_in_safe_spend: next }),
+      });
+      if (!res.ok) {
+        setAccounts((xs) =>
+          xs.map((a) => (a.id === id ? { ...a, includeInSafeSpend: !next } : a))
+        );
+        say('Could not update account', false);
+      }
+    }
+  };
+
+  const setAccountBalance = async (id, balance) => {
+    setAccounts((xs) => xs.map((a) => (a.id === id ? { ...a, balance } : a)));
+    if (live) {
+      const res = await fetch('/api/accounts', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id, balance_minor: balance }),
+      });
+      if (!res.ok) say('Could not update balance', false);
+    }
+  };
+
+  const signOut = async () => {
+    await fetch('/api/auth/logout', { method: 'POST' });
+    window.location.href = '/';
   };
 
   const setSetting = (k, v) => {
@@ -920,6 +1111,17 @@ function StoreProvider({ children }) {
         setShifts([]);
       }
     }
+    if (live && (k === 'emergencyFloor' || k === 'confirmThreshold' || k === 'inrDisplay')) {
+      const body = {};
+      if (k === 'emergencyFloor') body.emergency_floor_minor = v;
+      if (k === 'confirmThreshold') body.confirm_threshold_minor = v;
+      if (k === 'inrDisplay') body.inr_display = v;
+      fetch('/api/profile', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      }).catch(() => {});
+    }
   };
 
   const value = {
@@ -931,15 +1133,18 @@ function StoreProvider({ children }) {
     settings,
     employer,
     shifts,
-    categories: mock.categories,
-    budgets: mock.budgets,
+    categories,
+    budgets,
     quickChips: mock.quickChips,
     recentCommands: mock.recentCommands,
-    profile: mock.profile,
-    fx: mock.fx,
+    profile,
+    fx,
     rate,
-    today: mock.TODAY,
-    now: mock.NOW,
+    today,
+    now,
+    ready,
+    live,
+    authEmail,
     // derived
     spendable,
     reserved,
@@ -969,7 +1174,9 @@ function StoreProvider({ children }) {
     addDisbursement,
     markCommitmentPaid,
     toggleInclude,
+    setAccountBalance,
     setSetting,
+    signOut,
     toast,
     setToast,
     restore,
@@ -1617,7 +1824,7 @@ function Command({ nav }) {
     if (nav.focusCommand) ref.current?.focus();
   }, [nav.focusCommand]);
 
-  const account = s.accounts.find((a) => a.id === chip.accountId);
+  const account = matchAccount(s.accounts, chip.accountId) || s.accounts.find((a) => a.id === chip.accountId);
   const padMinor = toMinor(pad);
 
   const submit = () => {
@@ -1649,7 +1856,7 @@ function Command({ nav }) {
       amount: padMinor,
       merchant: chip.label,
       category: chip.categoryId,
-      accountId: chip.accountId,
+      accountId: account?.id || chip.accountId,
       date: s.today,
       note: '',
     };
@@ -1848,6 +2055,7 @@ function Dashboard({ nav }) {
 
   const maxCat = Math.max(...s.byCategory.map((c) => c.spent), 1);
   const nearest = s.upcoming.slice(0, 3);
+  const monthName = MONTHS[Number(s.today.slice(5, 7)) - 1] || '';
 
   return (
     <div className="page fade">
@@ -1941,7 +2149,7 @@ function Dashboard({ nav }) {
                   />
                 </div>
                 <p className="note" style={{ marginTop: 10 }}>
-                  Biggest line so far. Four shops since you landed.
+                  Biggest line so far this month.
                 </p>
               </Tile>
 
@@ -1955,7 +2163,7 @@ function Dashboard({ nav }) {
             </div>
           </Section>
 
-          <Section title="Where it went" aside="August">
+          <Section title="Where it went" aside={monthName}>
             <div>
               {s.byCategory.map((c) => (
                 <div className="cat" key={c.id}>
@@ -2213,8 +2421,10 @@ function Transactions({ nav }) {
     return [...map.entries()];
   }, [list]);
 
-  const accountName = (id) => s.accounts.find((a) => a.id === id)?.name || '—';
-  const isCash = (id) => s.accounts.find((a) => a.id === id)?.kind === 'cash';
+  const accountName = (id) =>
+    (matchAccount(s.accounts, id) || s.accounts.find((a) => a.id === id))?.name || '—';
+  const isCash = (id) =>
+    (matchAccount(s.accounts, id) || s.accounts.find((a) => a.id === id))?.kind === 'cash';
   const catName = (id) => s.categories.find((c) => c.id === id)?.name || id;
 
   const openEdit = (t) => {
@@ -2306,7 +2516,9 @@ function Transactions({ nav }) {
           <div className="daygroup" key={date}>
             <div className="daygroup__head">
               <Label>{dayLabel(date, s.today)}</Label>
-              <span className="caption">{gbp(rows.reduce((n, t) => n + t.amount, 0))}</span>
+              <span className="caption">
+                {gbp(rows.filter((t) => t.type === 'expense').reduce((n, t) => n + t.amount, 0))}
+              </span>
             </div>
             <div className="ledger">
               {i === 0 && preview ? (
@@ -2321,14 +2533,14 @@ function Transactions({ nav }) {
                 <Row
                   key={t.id}
                   title={t.merchant}
-                  sub={catName(t.category)}
+                  sub={t.type === 'income' ? 'Money in' : catName(t.category)}
                   marks={
                     <>
                       <span className="dot" />
                       <Mark cash={isCash(t.accountId)}>{isCash(t.accountId) ? 'cash' : 'card'}</Mark>
                     </>
                   }
-                  end={<Amount minor={t.amount} />}
+                  end={<Amount minor={t.amount} sign={t.type === 'income'} />}
                   onClick={() => openEdit(t)}
                 />
               ))}
@@ -2415,6 +2627,37 @@ function Transactions({ nav }) {
   );
 }
 
+function AccountBalance({ account, live, currency, onSave }) {
+  const [text, setText] = useState((account.balance / 100).toFixed(2));
+
+  useEffect(() => {
+    setText((account.balance / 100).toFixed(2));
+  }, [account.balance]);
+
+  if (!live) {
+    return currency === 'INR' ? (
+      <span className="amt amt--lg">{inr(account.balance)}</span>
+    ) : (
+      <Amount minor={account.balance} size="lg" />
+    );
+  }
+
+  return (
+    <input
+      className="input input--amt"
+      style={{ width: 108, textAlign: 'right' }}
+      inputMode="decimal"
+      value={text}
+      aria-label={`${account.name} balance`}
+      onChange={(e) => setText(e.target.value.replace(/[^\d.]/g, ''))}
+      onBlur={() => onSave(Math.round((parseFloat(text) || 0) * 100))}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') e.currentTarget.blur();
+      }}
+    />
+  );
+}
+
 /* ======== pages/Accounts.jsx ======== */
 function Accounts({ nav }) {
   const s = useStore();
@@ -2434,7 +2677,12 @@ function Accounts({ nav }) {
                 <span className="row__sub">{a.note}</span>
               </span>
               <span className="row__end" style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
-                <Amount minor={a.balance} size="lg" />
+                <AccountBalance
+                  account={a}
+                  live={s.live}
+                  currency="GBP"
+                  onSave={(balance) => s.setAccountBalance(a.id, balance)}
+                />
                 <Switch
                   on={a.includeInSafeSpend}
                   onChange={() => s.toggleInclude(a.id)}
@@ -2445,8 +2693,9 @@ function Accounts({ nav }) {
           ))}
         </div>
         <p className="note" style={{ marginTop: 12 }}>
-          The switch decides what counts towards safe-to-spend. Turn the forex card off if you’re
-          keeping it back for rent.
+          {s.live
+            ? 'Balances start at zero. Type what you actually hold, then the hero updates.'
+            : 'The switch decides what counts towards safe-to-spend. Turn the forex card off if you’re keeping it back for rent.'}
         </p>
       </Section>
 
@@ -2459,7 +2708,12 @@ function Accounts({ nav }) {
                 <span className="row__sub">{a.note}</span>
               </span>
               <span className="row__end">
-                <span className="amt amt--lg">{inr(a.balance)}</span>
+                <AccountBalance
+                  account={a}
+                  live={s.live}
+                  currency="INR"
+                  onSave={(balance) => s.setAccountBalance(a.id, balance)}
+                />
                 <span className="amt-inr">{gbp(Math.round(a.balance / s.rate))}</span>
               </span>
             </div>
@@ -2533,7 +2787,7 @@ function Budgets({ nav }) {
         ))}
       </Section>
 
-      <Section title="August so far">
+      <Section title={`${MONTHS[Number(s.today.slice(5, 7)) - 1] || ''} so far`}>
         <Leader k="Essentials" v={gbp(sum(essential, 'spent'))} />
         <Leader k="Everything else" v={gbp(sum(flexible, 'spent'))} />
         <Leader k="Spent" v={gbp(s.spentMonth)} total />
@@ -2788,25 +3042,38 @@ function Settings({ nav }) {
         </div>
       </Section>
 
-      <Section title="Demo">
+      {s.live ? null : (
+        <Section title="Demo">
+          <div className="ledger">
+            <SettingRow
+              title="Unlock the job"
+              note="Fills Work with an employer and three shifts"
+              control={<Switch on={s.settings.demoJob} onChange={(v) => set('demoJob', v)} label="Demo job" />}
+            />
+            <SettingRow
+              title="Offline"
+              note="Commands are held until you’re back"
+              control={<Switch on={s.settings.offline} onChange={(v) => set('offline', v)} label="Offline" />}
+            />
+          </div>
+        </Section>
+      )}
+
+      <Section title="Account">
         <div className="ledger">
           <SettingRow
-            title="Unlock the job"
-            note="Fills Work with an employer and three shifts"
-            control={<Switch on={s.settings.demoJob} onChange={(v) => set('demoJob', v)} label="Demo job" />}
-          />
-          <SettingRow
-            title="Offline"
-            note="Commands are held until you’re back"
-            control={<Switch on={s.settings.offline} onChange={(v) => set('offline', v)} label="Offline" />}
-          />
-          <SettingRow
-            title="Login screen"
-            note="One email, magic link"
+            title={s.live ? 'Signed in' : 'Sign in'}
+            note={s.live ? s.authEmail : 'One email, magic link'}
             control={
-              <Button variant="quiet" onClick={() => nav.navigate('/login')}>
-                View
-              </Button>
+              s.live ? (
+                <Button variant="quiet" onClick={s.signOut}>
+                  Sign out
+                </Button>
+              ) : (
+                <Button variant="quiet" onClick={() => nav.navigate('/login')}>
+                  Sign in
+                </Button>
+              )
             }
           />
         </div>
@@ -2818,8 +3085,9 @@ function Settings({ nav }) {
             Export everything
           </Button>
           <p className="note">
-            {s.profile.email} · {s.profile.course} · {s.profile.tz}. One account, one device at a
-            time. No bank passwords are ever stored.
+            {s.live
+              ? `${s.authEmail} · ${s.profile.tz}. Expenses you save now stay in Supabase.`
+              : `${s.profile.email} · ${s.profile.course} · ${s.profile.tz}. Demo numbers only — sign in to keep a real ledger.`}
           </p>
         </div>
       </Section>
@@ -2878,6 +3146,78 @@ function Login({ nav }) {
   const s = useStore();
   const [email, setEmail] = useState('');
   const [sent, setSent] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  const send = async () => {
+    if (!email.trim() || busy) return;
+    setBusy(true);
+    setError('');
+    try {
+      const res = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: email.trim() }),
+      });
+      if (!res.ok) {
+        setError(
+          res.status === 403
+            ? 'This app is locked to one email.'
+            : 'Could not send a link. Check the address and try again.'
+        );
+        return;
+      }
+      setSent(true);
+    } catch {
+      setError('Could not send a link. Check the address and try again.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (s.live) {
+    return (
+      <div className="page fade" style={{ display: 'flex', flexDirection: 'column', minHeight: '100vh' }}>
+        <div style={{ paddingTop: 88 }}>
+          <div
+            style={{
+              fontFamily: 'var(--font-display)',
+              fontSize: 19,
+              fontWeight: 500,
+              letterSpacing: '-0.01em',
+            }}
+          >
+            NottiPay
+          </div>
+          <h1
+            style={{
+              fontFamily: 'var(--font-display)',
+              fontSize: 34,
+              fontWeight: 500,
+              letterSpacing: '-0.025em',
+              lineHeight: 1.1,
+              margin: '14px 0 0',
+            }}
+          >
+            Signed in.
+          </h1>
+          <p className="note" style={{ marginTop: 12, maxWidth: '32ch' }}>
+            {s.authEmail}. This device keeps the session.
+          </p>
+        </div>
+        <div style={{ marginTop: 32 }}>
+          <Button variant="quiet" block onClick={s.signOut}>
+            Sign out
+          </Button>
+        </div>
+        <div style={{ marginTop: 'auto', paddingBottom: 40 }}>
+          <Button variant="primary" block onClick={() => nav.navigate('/dashboard')}>
+            Back to the board
+          </Button>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="page fade" style={{ display: 'flex', flexDirection: 'column', minHeight: '100vh' }}>
@@ -2906,7 +3246,7 @@ function Login({ nav }) {
         </h1>
         <p className="note" style={{ marginTop: 12, maxWidth: '32ch' }}>
           {sent
-            ? `A link is on its way to ${email || s.profile.email}. It works once and expires in ten minutes.`
+            ? `A link is on its way to ${email}. It works once.`
             : 'No password. A link arrives in your inbox and signs you in on this device.'}
         </p>
       </div>
@@ -2919,12 +3259,23 @@ function Login({ nav }) {
             style={{ marginTop: 6 }}
             type="email"
             value={email}
-            placeholder={s.profile.email}
+            placeholder="you@email.com"
             onChange={(e) => setEmail(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                e.preventDefault();
+                send();
+              }
+            }}
           />
+          {error ? (
+            <p className="note" style={{ marginTop: 10, color: 'var(--band-stop)' }}>
+              {error}
+            </p>
+          ) : null}
           <div style={{ marginTop: 16 }}>
-            <Button variant="primary" block lg onClick={() => setSent(true)}>
-              Send the link
+            <Button variant="primary" block lg onClick={send}>
+              {busy ? 'Sending…' : 'Send the link'}
             </Button>
           </div>
         </div>
@@ -2932,7 +3283,7 @@ function Login({ nav }) {
 
       <div style={{ marginTop: 'auto', paddingBottom: 40 }}>
         <Button variant="quiet" block onClick={() => nav.navigate('/dashboard')}>
-          Back to the demo
+          Back to the board
         </Button>
       </div>
     </div>
@@ -2955,6 +3306,7 @@ const PAGES = {
 };
 
 function Shell() {
+  const s = useStore();
   const [route, setRoute] = useState('/dashboard');
   const [preview, setPreview] = useState(null);
   const [highlight, setHighlight] = useState(null);
@@ -2980,8 +3332,33 @@ function Shell() {
     return () => window.removeEventListener('keydown', onKey);
   }, []);
 
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('signedin')) {
+      s.say('Signed in', false);
+      window.history.replaceState({}, '', '/');
+    }
+    if (params.get('auth') === 'error') {
+      s.say('Sign-in link failed — request a new one', false);
+      window.history.replaceState({}, '', '/');
+      setRoute('/login');
+    }
+    // Read the landing query once.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const Page = PAGES[route] || Dashboard;
   const nav = { route, navigate, preview, setPreview, highlight, setHighlight, focusCommand };
+
+  if (!s.ready) {
+    return (
+      <div className="app">
+        <div className="page" style={{ paddingTop: 88 }}>
+          <p className="note">Opening the book…</p>
+        </div>
+      </div>
+    );
+  }
 
   if (route === '/login') {
     return (
